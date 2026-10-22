@@ -6,6 +6,7 @@
     <title>SQUAD GAME AR - Interactive Classroom Quiz</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
 
@@ -394,6 +395,14 @@
                         <option value="low">Longgar (Sensitivitas Rendah)</option>
                     </select>
                     <p class="text-[11px] text-gray-400 mt-1">*Ubah ke Longgar jika ruangan redup atau kamera bergetar.</p>
+                </div>
+
+                <div>
+                    <label class="flex items-center gap-2 text-xs font-bold text-gray-300 uppercase cursor-pointer">
+                        <input type="checkbox" id="setting-face" checked class="w-4 h-4 accent-pink-500">
+                        Deteksi Mimik Wajah (kedip, senyum, ekspresi)
+                    </label>
+                    <p class="text-[11px] text-gray-400 mt-1">Saat lampu merah, berkedip, tersenyum, membuka mulut, atau mengangkat alis = tereliminasi. Hadapkan wajah ke kamera dengan cahaya cukup. Ikuti pengaturan sensitivitas di atas.</p>
                 </div>
 
                 <div>
@@ -1213,6 +1222,7 @@ Balas HANYA dengan JSON valid tanpa teks lain, dengan format:
             audioMode('red');
             redStartedAt = performance.now();
             redFingerFrames = 0;
+            resetFaceState();
             resetFingerState();
 
             // Disable Quiz Input
@@ -1317,6 +1327,7 @@ Balas HANYA dengan JSON valid tanpa teks lain, dengan format:
 
             dollContainer.classList.remove('walking', 'scanning');
             audioMode('over');
+            resetFaceState();
             resetFingerState();
 
             // Turn doll to front
@@ -1370,11 +1381,23 @@ Balas HANYA dengan JSON valid tanpa teks lain, dengan format:
             handsInst = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
             handsInst.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
             handsInst.onResults(onHandResults);
+            if (typeof FaceMesh !== 'undefined') {
+                faceInst = new FaceMesh({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}` });
+                faceInst.setOptions({ maxNumFaces: 1, refineLandmarks: false, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+                faceInst.onResults(onFaceResults);
+            } else {
+                console.warn('Library MediaPipe FaceMesh gagal dimuat; deteksi mimik wajah nonaktif.');
+            }
 
             async function handLoop() {
                 if (gameState !== "GAME_OVER" && video.readyState >= 2 && !handBusy) {
                     handBusy = true;
-                    try { await handsInst.send({ image: video }); } catch (e) { console.error(e); }
+                    // Saat lampu merah, bergantian: tangan -> wajah (satu per satu agar ringan)
+                    const useFace = faceInst && gameState === "RED_LIGHT" && faceEnabled() && (faceToggle = !faceToggle);
+                    try {
+                        if (useFace) await faceInst.send({ image: video });
+                        else await handsInst.send({ image: video });
+                    } catch (e) { console.error(e); }
                     handBusy = false;
                 }
                 requestAnimationFrame(handLoop);
@@ -1409,6 +1432,72 @@ Balas HANYA dengan JSON valid tanpa teks lain, dengan format:
             fingerCand = 0;
             if (fingerProgress) fingerProgress.style.width = '0%';
             setFingerHighlight(0);
+        }
+
+        // --- MIMIK WAJAH (MediaPipe FaceMesh): kedip, senyum, mulut terbuka, alis naik = pelanggaran saat lampu merah ---
+        let faceInst = null, faceToggle = false;
+        let faceBase = null, faceSamples = [], faceViolFrames = {};
+        const faceEnabled = () => { const el = document.getElementById('setting-face'); return !el || el.checked; };
+        const FACE_SENS = { high: 0.7, medium: 1, low: 1.5 };
+
+        function faceMetrics(lm) {
+            const d = (a, b) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y);
+            const fw = d(234, 454) || 1; // lebar wajah sebagai skala
+            const earL = d(159, 145) / (d(33, 133) || 1);
+            const earR = d(386, 374) / (d(362, 263) || 1);
+            const midLipY = (lm[13].y + lm[14].y) / 2;
+            const cornerY = (lm[61].y + lm[291].y) / 2;
+            return {
+                ear: (earL + earR) / 2,
+                width: d(61, 291) / fw,                  // melebar saat senyum
+                lift: (midLipY - cornerY) / fw,          // sudut bibir naik saat senyum
+                open: d(13, 14) / fw,                    // mulut terbuka
+                brow: (d(105, 159) + d(334, 386)) / 2 / fw // alis naik
+            };
+        }
+
+        function resetFaceState() { faceBase = null; faceSamples = []; faceViolFrames = {}; }
+
+        function onFaceResults(res) {
+            if (gameState !== "RED_LIGHT" || !faceEnabled()) return;
+            const lm = res.multiFaceLandmarks && res.multiFaceLandmarks[0];
+            if (!lm) return;
+            const m = faceMetrics(lm);
+            const t = performance.now() - redStartedAt;
+
+            // Fase kalibrasi: 0.3-1.0 detik pertama lampu merah = wajah "diam" sebagai acuan
+            if (!faceBase) {
+                if (t < 300) return;
+                faceSamples.push(m);
+                if (t >= 1000 && faceSamples.length >= 3) {
+                    const avg = k => faceSamples.reduce((a, x) => a + x[k], 0) / faceSamples.length;
+                    faceBase = { ear: avg('ear'), width: avg('width'), lift: avg('lift'), open: avg('open'), brow: avg('brow') };
+                }
+                return;
+            }
+
+            const k = FACE_SENS[config.sensitivity] || 1;
+            const checks = {
+                blink: faceBase.ear > 0.12 && m.ear < faceBase.ear * (1 - 0.35 * k),
+                smile: (m.width - faceBase.width) > 0.035 * k || (m.lift - faceBase.lift) > 0.018 * k,
+                mouth: (m.open - faceBase.open) > 0.03 * k,
+                brow:  (m.brow - faceBase.brow) > 0.012 * k
+            };
+            const reasons = {
+                blink: 'BERKEDIP SAAT LAMPU MERAH!',
+                smile: 'TERSENYUM SAAT LAMPU MERAH!',
+                mouth: 'MULUT BERGERAK SAAT LAMPU MERAH!',
+                brow:  'MIMIK WAJAH BERUBAH SAAT LAMPU MERAH!'
+            };
+            for (const key in checks) {
+                faceViolFrames[key] = checks[key] ? (faceViolFrames[key] || 0) + 1 : 0;
+                // kedip cukup 2 frame (singkat), lainnya 3 frame berturut-turut
+                if (faceViolFrames[key] >= (key === 'blink' ? 2 : 3)) {
+                    resetFaceState();
+                    triggerGameOver(reasons[key]);
+                    return;
+                }
+            }
         }
 
         let redFingerFrames = 0, redStartedAt = 0;
